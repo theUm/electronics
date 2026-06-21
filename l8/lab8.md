@@ -122,7 +122,7 @@ R2=750/0.25=30k Ohm
 
 Реальні компоненти:
 
-![img_19.png](img_19.png)
+![img_19.png](timer-ezgif.com-video-to-gif-converter.gif)
 
 ![img_18.png](img_18.png)
 
