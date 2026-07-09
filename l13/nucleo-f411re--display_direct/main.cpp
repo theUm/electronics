@@ -64,10 +64,11 @@ void setup()
 
 {
     // датчик LM35DZ підключений напряму до STM32 та підсилювач, тому використовуємо апаратний АЦП
-    Serial.begin(9600);
+    Serial.begin(115200);
 
     // Апаратний UART на пінах D0 (RX) та D1 (TX) для зв'язку з ESP32-C3
     espSerial.begin(115200);
+    espSerial.setTimeout(10);
 
     // Формуємо живлення для дисплея
     pinMode(PIN_DISP_VCC, OUTPUT);
@@ -90,19 +91,26 @@ void loop()
 {
 
     // --- Зчитування вхідних даних від ESP32-C3 ---
-    if (espSerial.available()) 
+    while (espSerial.available() > 0) 
     {
         String incoming = espSerial.readStringUntil('\n');
         incoming.trim();
         
-        // Перевірка префіксу з IP-адресою
-        if (incoming.startsWith("IP:")) 
+        if (incoming.length() > 0)
         {
-            esp_ip = incoming.substring(3);
-        }
-        else if (incoming.startsWith("RSSI:"))
-        {
-            esp_rssi = incoming.substring(5);
+            // Логування всього отриманого
+            Serial.print("[RX from ESP32]: ");
+            Serial.println(incoming);
+
+            // Перевірка префіксів
+            if (incoming.startsWith("IP:")) 
+            {
+                esp_ip = incoming.substring(3);
+            }
+            else if (incoming.startsWith("RSSI:"))
+            {
+                esp_rssi = incoming.substring(5);
+            }
         }
     }
 
@@ -128,42 +136,43 @@ void loop()
     // Переводимо у градуси (10 мВ = 1 °C)
     float temperature = sensor_voltage_mv / 10.0;
 
-    // Вивід на дисплей
+    // Вивід на дисплей (128x64)
     u8g2.clearBuffer();
-
-    u8g2.setCursor(0, 16);
     u8g2.setFont(u8g2_font_unifont_t_cyrillic);
-    u8g2.print("ТЕМПЕРАТУРА:");
 
+    // 1-й рядок: Температура
+    u8g2.setCursor(0, 15);
+    u8g2.print("ТЕМП: ");
     u8g2.print(temperature, 1);
-    u8g2.print(" \xC2\xB0"
-               "C");
+    u8g2.print(" \xC2\xB0" "C");
 
-
-    // Виведення RSSI у верхньому правому кутку або другим рядком
-    u8g2.setCursor(0, 28);
-    u8g2.print("Wi-Fi: ");
+    // 2-й рядок: Рівень сигналу Wi-Fi
+    u8g2.setCursor(0, 30);
+    u8g2.print("RSSI: ");
     u8g2.print(esp_rssi);
     u8g2.print(" dBm");
 
+    // 3-й рядок: IP-адреса
+    u8g2.setCursor(0, 45);
+    u8g2.print(esp_ip);
+
+    // 4-й рядок: Суб'єктивний вердикт
     const char *verdict = get_summer_verdict(temperature);
-    u8g2.setFont(u8g2_font_unifont_t_cyrillic);
-    u8g2.drawUTF8(4, 40, verdict);
+    u8g2.drawUTF8(0, 60, verdict);
     u8g2.sendBuffer();
 
     // Дублювання у Serial
     Serial.print(temperature, 1);
     Serial.print(" C ");
     Serial.println(verdict);
+    Serial.println();
 
-    // Відправка JSON-пакету на ESP32-C3 через espSerial (USART6)
-    espSerial.print("{\"temp\":");
-    espSerial.print(temperature, 1);
-    espSerial.print(", \"verdict\":\"");
-    espSerial.print(verdict);
-    espSerial.print("\", \"ip\":\"");
-    espSerial.print(esp_ip);
-    espSerial.println("\"}");
+
+    // Відправка температури та вердикту на ESP32-C3 через espSerial (USART6)
+    espSerial.print("TEMP:");
+    espSerial.println(temperature, 1);
+    espSerial.print("VERDICT:");
+    espSerial.println(verdict);
 
     delay(1000);
 }
