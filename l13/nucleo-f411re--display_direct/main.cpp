@@ -66,7 +66,7 @@ void setup()
     // датчик LM35DZ підключений напряму до STM32 та підсилювач, тому використовуємо апаратний АЦП
     Serial.begin(115200);
 
-    // Апаратний UART на пінах D0 (RX) та D1 (TX) для зв'язку з ESP32-C3
+    // Апаратний UART на пінах D0 (RX) та D1 (TX) для зв'язку з ESP32D
     espSerial.begin(115200);
     espSerial.setTimeout(10);
 
@@ -90,12 +90,12 @@ void setup()
 void loop()
 {
 
-    // --- Зчитування вхідних даних від ESP32-C3 ---
-    while (espSerial.available() > 0) 
+    // --- Зчитування вхідних даних від ESP32D ---
+    while (espSerial.available() > 0)
     {
         String incoming = espSerial.readStringUntil('\n');
         incoming.trim();
-        
+
         if (incoming.length() > 0)
         {
             // Логування всього отриманого
@@ -103,7 +103,7 @@ void loop()
             Serial.println(incoming);
 
             // Перевірка префіксів
-            if (incoming.startsWith("IP:")) 
+            if (incoming.startsWith("IP:"))
             {
                 esp_ip = incoming.substring(3);
             }
@@ -168,7 +168,7 @@ void loop()
     Serial.println();
 
 
-    // Відправка температури та вердикту на ESP32-C3 через espSerial (USART6)
+    // Відправка температури та вердикту на ESP32D через espSerial (USART6)
     espSerial.print("TEMP:");
     espSerial.println(temperature, 1);
     espSerial.print("VERDICT:");
