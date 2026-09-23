@@ -1,6 +1,7 @@
 name: Redis keepalive
 
 on:
+  workflow_dispatch:
   schedule:
     # Runs every Monday at 8 AM UTC (11 AM Kyiv time)
     - cron: '0 8 * * 1'
@@ -11,6 +12,7 @@ jobs:
     steps:
       - name: Run curl command
         run: |
-          curl ${{ secrets.REDIS_URL_ENDPOINT }} \
+          curl --fail-with-body --silent --show-error \
+            "${{ secrets.REDIS_URL_ENDPOINT }}" \
             -H "Authorization: Bearer ${{ secrets.REDIS_PW }}" \
             -d '"keepalive"'
