@@ -1,0 +1,16 @@
+name: Redis keepalive
+
+on:
+  schedule:
+    # Runs every Monday at 8 AM UTC (11 AM Kyiv time)
+    - cron: '0 8 * * 1'
+
+jobs:
+  redis-keepalive:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Run curl command
+        run: |
+          curl ${{ secrets.REDIS_URL_ENDPOINT }} \
+            -H "Authorization: Bearer ${{ secrets.REDIS_PW }}" \
+            -d '"keepalive"'
