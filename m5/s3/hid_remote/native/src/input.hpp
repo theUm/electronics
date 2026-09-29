@@ -160,7 +160,10 @@ struct Clicks {
         const Action action = actionFor(press_direction);
         if (action != Action::none) {
           if (pending_count && now - last_click > multi_click_gap_ms) flushPending();
-          if (pending_count < 2) pending[pending_count++] = action;
+          if (action != Action::play_pause) {
+            flushPending();
+            enqueue(action);
+          } else if (pending_count < 2) pending[pending_count++] = action;
           else {
             if (pending[0] == Action::play_pause &&
                 pending[1] == Action::play_pause &&
@@ -188,36 +191,8 @@ struct Clicks {
     --ready_count;
     return action;
   }
-};
 
-struct Shake {
-  bool first_hit = false;
-  bool triggered = false;
-  uint32_t last_hit = 0;
-  uint32_t last_trigger = 0;
-
-  bool update(float ax, float ay, float az, uint32_t now) {
-    const float magnitude2 = ax * ax + ay * ay + az * az;
-    if (!std::isfinite(magnitude2) || magnitude2 < 0.04f) {
-      first_hit = false;
-      return false;
-    }
-    if (triggered && now - last_trigger < 1600) return false;
-    const bool strong = magnitude2 >= 2.25f || magnitude2 <= 0.25f;
-    if (!strong) {
-      if (first_hit && now - last_hit > 300) first_hit = false;
-      return false;
-    }
-    if (first_hit && now - last_hit <= 300) {
-      first_hit = false;
-      triggered = true;
-      last_trigger = now;
-      return true;
-    }
-    first_hit = true;
-    last_hit = now;
-    return false;
-  }
+  bool busy() const { return raw || stable || wait_release || pending_count || ready_count; }
 };
 
 struct DisplayIdle {

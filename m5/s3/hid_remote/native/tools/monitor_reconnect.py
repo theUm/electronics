@@ -31,9 +31,13 @@ def main():
             print(f"[{time.strftime('%H:%M:%S')}] USB {port or 'disconnected'}", flush=True)
         if port and handle is None:
             try:
-                handle = serial.Serial(port, 115200, timeout=0.2, dsrdtr=False, rtscts=False)
+                # Set modem lines before opening: pyserial's default DTR assertion
+                # can reset the native USB device back into download mode.
+                handle = serial.Serial(None, 115200, timeout=0.2, dsrdtr=False, rtscts=False)
                 handle.dtr = False
                 handle.rts = False
+                handle.port = port
+                handle.open()
             except serial.SerialException:
                 handle = None
         if handle:

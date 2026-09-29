@@ -1,10 +1,16 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
+#include <esp_pm.h>
+#include <esp_sleep.h>
+#include <algorithm>
 
 #include <cstring>
 #include "ble_remote.hpp"
 #include "input.hpp"
+#include "activity.hpp"
+#include "motion.hpp"
 
 namespace {
 
@@ -17,9 +23,22 @@ constexpr uint8_t kBrightness = 60;
 BleRemote ble;
 remote::Tilt tilt;
 remote::Clicks clicks;
-remote::Shake shake;
-remote::ImuSchedule* imu_schedule = nullptr;
+Motion motion;
+remote::Activity* activity = nullptr;
 remote::DisplayIdle* display_idle = nullptr;
+TaskHandle_t app_task = nullptr;
+esp_pm_lock_handle_t usb_lock = nullptr;
+esp_pm_lock_handle_t button_lock = nullptr;
+esp_pm_lock_handle_t display_sleep_lock = nullptr;
+esp_pm_lock_handle_t display_clock_lock = nullptr;
+bool display_locks_held = false;
+bool usb_powered = false;
+bool button_lock_held = false;
+bool was_a = false;
+uint32_t last_sample = 0;
+uint32_t stopped_at = 0;
+uint32_t last_usb_check = 0;
+uint32_t motion_wakes = 0;
 remote::Direction direction = remote::Direction::flat;
 uint32_t epoch = 0;
 uint32_t last_draw = 0;
@@ -32,6 +51,52 @@ bool screen_dirty = true;
 bool side_pressed = false;
 String last_view;
 String last_status;
+
+void holdDisplay(bool hold) {
+  if (hold == display_locks_held) return;
+  if (hold) {
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(display_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(display_clock_lock));
+  } else {
+    ESP_ERROR_CHECK(esp_pm_lock_release(display_clock_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_release(display_sleep_lock));
+  }
+  display_locks_held = hold;
+}
+
+uint32_t usbCheckInterval() { return usb_powered ? 1000u : 5000u; }
+
+void ARDUINO_ISR_ATTR wakeTask(void* arg) {
+  // gpio_wakeup_enable uses a level interrupt even while the CPU is awake.
+  // Mask until task context clears the source, otherwise it starves the task.
+  gpio_intr_disable(static_cast<gpio_num_t>(reinterpret_cast<uintptr_t>(arg)));
+  BaseType_t higher_priority = pdFALSE;
+  if (app_task) vTaskNotifyGiveFromISR(app_task, &higher_priority);
+  if (higher_priority) portYIELD_FROM_ISR();
+}
+
+void updateUsb() {
+  const bool powered = motion.usbPowered();
+  if (powered == usb_powered) return;
+  usb_powered = powered;
+  if (powered) esp_pm_lock_acquire(usb_lock);
+  else esp_pm_lock_release(usb_lock);
+  Serial.printf("POWER USB=%u light_sleep=%s motion_wakes=%lu\n", powered,
+                powered ? "blocked for USB" : "enabled", static_cast<unsigned long>(motion_wakes));
+}
+
+void startActivity(uint32_t now) {
+  if (activity->touch(now)) {
+    tilt.reset();
+    last_sample = now - 20;
+    Serial.println("POWER active");
+  }
+}
+
+void waitForWork(uint32_t milliseconds) {
+  // Pending notifications survive the final state check and prevent a lost wake.
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(std::max<uint32_t>(1, milliseconds)));
+}
 
 const char* orientation(remote::Direction mode) {
   switch (mode) {
@@ -113,12 +178,14 @@ void draw(bool force) {
 void sleepDisplay() {
   M5.Display.setBrightness(0);
   M5.Display.powerSaveOn();
+  holdDisplay(false);
   Serial.println("DISPLAY sleep");
 }
 
 void wakeDisplay() {
+  holdDisplay(true);
   M5.Display.powerSaveOff();
-  M5.Display.setBrightness(kBrightness);
+  // The loop restores brightness after the complete wake redraw.
   screen_dirty = true;
   Serial.println("DISPLAY wake");
 }
@@ -128,20 +195,39 @@ void showStopped() {
   M5.Display.fillScreen(kBackground);
   displayLine(36, 28, "Remote stopped", 0xFFFFFF, 2.2f);
   displayLine(70, 28, "Reset to restart", kMuted, 2.0f);
+  M5.Display.setBrightness(kBrightness);
 }
 
 }  // namespace
 
 void setup() {
-  M5.begin();
+  auto config = M5.config();
+  config.internal_imu = false;
+  // PM1 owns Reset/Power single-reset and double-shutdown. getPekPress()
+  // clears the same status bits PM1 uses for those hardware actions.
+  config.pmic_button = false;
+  M5.begin(config);
   Serial.begin(115200);
-  Serial.println("M5 Media Remote native-0.1");
+  Serial.println("M5 Media Remote native-0.2-motion");
   WiFi.mode(WIFI_OFF);
   M5.Speaker.end();
   M5.Mic.end();
   M5.Power.setLed(0);
-  setCpuFrequencyMhz(80);
-  Serial.printf("POWER CPU MHz %u\n", getCpuFrequencyMhz());
+  app_task = xTaskGetCurrentTaskHandle();
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb", &usb_lock));
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "button", &button_lock));
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "display", &display_sleep_lock));
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "display_spi", &display_clock_lock));
+  holdDisplay(true);
+  // Start locked until the PM1 power source has been read.
+  ESP_ERROR_CHECK(esp_pm_lock_acquire(usb_lock));
+  usb_powered = true;
+  esp_pm_config_esp32s3_t pm_config{};
+  pm_config.max_freq_mhz = 80;
+  pm_config.min_freq_mhz = 40;
+  pm_config.light_sleep_enable = true;
+  ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+  Serial.println("POWER DFS=40..80MHz automatic_light_sleep=enabled");
   M5.BtnA.setDebounceThresh(0);
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kBrightness);
@@ -150,17 +236,30 @@ void setup() {
   M5.Display.fillScreen(kBackground);
 
   const uint32_t now = millis();
-  static remote::ImuSchedule schedule(now);
+  static remote::Activity active(now);
   static remote::DisplayIdle idle(now);
-  imu_schedule = &schedule;
+  activity = &active;
   display_idle = &idle;
+  pinMode(13, INPUT_PULLUP);
+  if (!motion.begin()) Serial.println("IMU configuration failed: input requires valid acceleration");
+  for (int pin : {11, 12, 13}) {
+    pinMode(pin, INPUT_PULLUP);
+    gpio_sleep_sel_dis(static_cast<gpio_num_t>(pin));
+    attachInterruptArg(pin, wakeTask, reinterpret_cast<void*>(static_cast<uintptr_t>(pin)), FALLING);
+    ESP_ERROR_CHECK(gpio_wakeup_enable(static_cast<gpio_num_t>(pin), GPIO_INTR_LOW_LEVEL));
+  }
+  ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+  updateUsb();
+  last_usb_check = now;
   readBattery();
   last_battery_poll = now;
+  ble.setWakeTask(app_task);
   if (!ble.begin(battery_level)) {
     Serial.println("BLE init failed");
     M5.Display.setTextColor(0xFFFFFF, kBackground);
     M5.Display.drawString("BLE init failed", 5, 40);
     stopped = true;
+    stopped_at = now;
     return;
   }
   epoch = ble.epoch();
@@ -169,14 +268,37 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t now = millis();
+  const bool irq = digitalRead(13) == LOW;
+  const bool moved = irq && motion.serviceIrq();
+  if (irq || now - last_usb_check >= usbCheckInterval()) {
+    updateUsb();
+    last_usb_check = now;
+  }
   if (stopped) {
-    delay(100);
+    if (display_idle->screen_on && now - stopped_at >= 3000) {
+      sleepDisplay();
+      display_idle->screen_on = false;
+    }
+    if (digitalRead(13) == HIGH) gpio_intr_enable(GPIO_NUM_13);
+    const uint32_t screen_wait = display_idle->screen_on ? remote::remaining(now, stopped_at, 3000) : 60000;
+    waitForWork(std::min(screen_wait, remote::remaining(now, last_usb_check, usbCheckInterval())));
     return;
   }
-  const uint32_t now = millis();
+  if (moved) {
+    if (!activity->active) ++motion_wakes;
+    startActivity(now);
+  }
   M5.update();
   const bool button_a = M5.BtnA.isPressed();
   const bool button_b = M5.BtnB.isPressed();
+  const bool pressed = button_a || button_b;
+  if (pressed != button_lock_held) {
+    if (pressed) esp_pm_lock_acquire(button_lock);
+    else esp_pm_lock_release(button_lock);
+    button_lock_held = pressed;
+  }
+  if (pressed) startActivity(now);
   if (button_a || button_b) {
     if (display_idle->activity(now)) wakeDisplay();
   } else if (display_idle->poll(now)) {
@@ -195,28 +317,28 @@ void loop() {
     last_status = status;
   }
 
-  bool fresh_press = false;
-  uint32_t sample_ms = 0;
+  const bool fresh_press = button_a && !was_a;
+  was_a = button_a;
+  const uint32_t sample_ms = now - last_sample;
   float ax = 0, ay = 0, az = 0;
-  if (imu_schedule->update(now, button_a, fresh_press, sample_ms)) {
+  if (fresh_press || ((activity->active || !motion.wakeReady()) && sample_ms >= 20)) {
+    last_sample = now;
     if (fresh_press) tilt.reset();
-    const bool accel_ok = M5.Imu.isEnabled() && M5.Imu.getAccel(&ax, &ay, &az);
+    const bool accel_ok = motion.read(ax, ay, az);
     if (!accel_ok) ax = ay = az = 0;
     direction = tilt.update(ax, ay, az, sample_ms);
-    if (accel_ok && !display_idle->screen_on && shake.update(ax, ay, az, now)) {
-      display_idle->activity(now, 1300);
-      wakeDisplay();
-      Serial.printf("DISPLAY shake wake accel %.3f %.3f %.3f\n", ax, ay, az);
-    }
   }
   const auto gesture = tilt.valid ? direction : remote::Direction::invalid;
   const auto action = clicks.update(now, button_a, gesture);
   if (action != remote::Action::none) {
     const bool sent = ble.send(action);
+    Serial.printf("INPUT release_to_queue_ms=%lu\n", static_cast<unsigned long>(now - clicks.raw_since));
     Serial.printf("INPUT %s %s accel %.3f %.3f %.3f pitch %.1f roll %.1f\n",
                   label(action), sent ? "queued" : "dropped", ax, ay, az,
                   tilt.pitch_deg, tilt.roll_deg);
   }
+  // Start newly queued HID reports this iteration, without waiting for another tick.
+  ble.poll(now);
 
   if (button_b) {
     if (!side_pressed) {
@@ -225,6 +347,16 @@ void loop() {
     } else if (now - side_down >= 1500) {
       ble.stop();
       stopped = true;
+      stopped_at = now;
+      motion.stop();
+      for (int pin : {11, 12}) {
+        detachInterrupt(pin);
+        gpio_wakeup_disable(static_cast<gpio_num_t>(pin));
+      }
+      if (button_lock_held) {
+        esp_pm_lock_release(button_lock);
+        button_lock_held = false;
+      }
       showStopped();
       return;
     }
@@ -237,11 +369,34 @@ void loop() {
     readBattery();
     last_battery_poll = now;
     if (battery_level != previous) ble.setBatteryLevel(battery_level);
+    if (usb_powered) {
+      Serial.printf("POWER motion_wakes=%lu irq_ok=%u\n",
+                    static_cast<unsigned long>(motion_wakes), motion.wakeReady());
+      esp_pm_dump_locks(stdout);
+    }
   }
   if (display_idle->screen_on && (screen_dirty || now - last_draw >= 200)) {
     draw(screen_dirty);
+    if (screen_dirty) M5.Display.setBrightness(kBrightness);
     last_draw = now;
     screen_dirty = false;
   }
-  delay(20);
+  if (activity->poll(now, clicks.busy() || ble.pendingInput() || pressed)) {
+    Serial.println("POWER idle: waiting for motion");
+  }
+  uint32_t wait_ms = ble.waitMs(now);
+  if (activity->active || !motion.wakeReady() || clicks.busy()) wait_ms = std::min(wait_ms, 10u);
+  if (display_idle->screen_on) {
+    wait_ms = std::min(wait_ms, remote::remaining(now, display_idle->last_activity, display_idle->timeout_ms));
+  }
+  wait_ms = std::min(wait_ms, remote::remaining(now, last_battery_poll, 60000));
+  wait_ms = std::min(wait_ms, remote::remaining(now, last_usb_check, usbCheckInterval()));
+  // A failed IRQ path retains periodic source checks as well as acceleration reads.
+  if (!motion.wakeReady()) wait_ms = std::min(wait_ms, 50u);
+  for (int pin : {11, 12, 13}) {
+    if (pin == 13 && !motion.wakeReady()) continue;
+    if (digitalRead(pin) == HIGH) gpio_intr_enable(static_cast<gpio_num_t>(pin));
+    else wait_ms = std::min(wait_ms, 10u);
+  }
+  waitForWork(wait_ms);
 }

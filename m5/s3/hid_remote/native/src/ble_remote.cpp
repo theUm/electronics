@@ -1,6 +1,7 @@
 #include "ble_remote.hpp"
 
 #include <cstring>
+#include "activity.hpp"
 
 namespace {
 
@@ -59,6 +60,7 @@ String BleRemote::staticIdentity() {
 
 void BleRemote::emitEvent(const Event& event) {
   if (events_) xQueueSend(events_, &event, 0);
+  if (wake_task_) xTaskNotifyGive(wake_task_);
 }
 
 void BleRemote::ServerCallbacks::onConnect(NimBLEServer*, NimBLEConnInfo& info) {
@@ -197,6 +199,11 @@ void BleRemote::handleEvent(const Event& event, uint32_t now) {
       clearReports();
       ++epoch_;
       Serial.printf("BLE connect bonds %u\n", static_cast<unsigned>(NimBLEDevice::getNumBonds()));
+      {
+        const auto info = server_->getPeerInfoByHandle(conn_handle_);
+        Serial.printf("BLE params interval=%u latency=%u timeout=%u\n",
+                      info.getConnInterval(), info.getConnLatency(), info.getConnTimeout());
+      }
       break;
     case EventType::disconnect:
       if (event.handle != conn_handle_) break;
@@ -211,6 +218,7 @@ void BleRemote::handleEvent(const Event& event, uint32_t now) {
       if (running_) startAdvertising(true, now);
       break;
     case EventType::auth:
+      last_bond_count_ = NimBLEDevice::getNumBonds();
       Serial.printf("BLE auth encrypted=%u bonded=%u key_size=%u bonds=%u\n",
                     event.flags & 1, (event.flags >> 1) & 1, event.key_size,
                     static_cast<unsigned>(NimBLEDevice::getNumBonds()));
@@ -265,16 +273,12 @@ bool BleRemote::notifyReport(const Report& report, bool release) {
 void BleRemote::poll(uint32_t now) {
   if (!running_) return;
   Event event(EventType::identity);
-  while (xQueueReceive(events_, &event, 0) == pdTRUE) handleEvent(event, now);
-  if (now - last_bond_poll_ >= 1000) {
-    last_bond_poll_ = now;
-    const uint8_t count = NimBLEDevice::getNumBonds();
-    if (count != last_bond_count_) {
-      last_bond_count_ = count;
-      Serial.printf("BLE bonds changed %u\n", static_cast<unsigned>(count));
-    }
+  bool changed = false;
+  while (xQueueReceive(events_, &event, 0) == pdTRUE) {
+    handleEvent(event, now);
+    changed = true;
   }
-  refreshSecurity();
+  if (changed || (connected_ && !encrypted_)) refreshSecurity();
 
   if (!connected_) {
     if (!advertising_active_) startAdvertising(true, now);
@@ -348,7 +352,7 @@ const char* BleRemote::status() const {
   if (!connected_) return "Pair via BT";
   if (!encrypted_) return "Pairing...";
   if (suspended_) return "Suspended";
-  if (!bonded_ || NimBLEDevice::getNumBonds() == 0) return "No bond";
+  if (!bonded_) return "No bond";
   return "Connected";
 }
 
@@ -368,4 +372,22 @@ void BleRemote::stop() {
   if (server_ && connected_) server_->disconnect(conn_handle_);
   NimBLEDevice::deinit(false);
   Serial.println("BLE stopped");
+}
+
+uint32_t BleRemote::waitMs(uint32_t now) const {
+  if (!running_) return 60000;
+  if (events_ && uxQueueMessagesWaiting(events_)) return 0;
+  if (!connected_) {
+    if (!advertising_active_) return 1000;
+    return advertising_slow_ ? 60000 : remote::remaining(now, advertising_since_, 30000);
+  }
+  if (!encrypted_) {
+    if (!security_requests_) return remote::remaining(now, connected_since_,
+                                                    last_bond_count_ ? 4000 : 1200);
+    if (security_requests_ == 1) return remote::remaining(now, last_security_request_, 10000);
+    return 1000;
+  }
+  if (suspended_) return 60000;
+  if (pending_.characteristic) return remote::remaining(now, pressed_at_, 40);
+  return queue_size_ ? 0 : 60000;
 }

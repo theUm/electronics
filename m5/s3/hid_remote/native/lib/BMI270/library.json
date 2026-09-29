@@ -1,0 +1,6 @@
+{
+  "name": "BoschBMI270",
+  "version": "2.86.1",
+  "license": "BSD-3-Clause",
+  "build": { "srcDir": ".", "includeDir": "." }
+}

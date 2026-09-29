@@ -5,6 +5,7 @@
 #include <NimBLEHIDDevice.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/task.h>
 #include <cstdint>
 #include "input.hpp"
 
@@ -15,6 +16,9 @@ class BleRemote {
   void stop();
   bool send(remote::Action action);
   void setBatteryLevel(uint8_t level);
+  void setWakeTask(TaskHandle_t task) { wake_task_ = task; }
+  uint32_t waitMs(uint32_t now) const;
+  bool pendingInput() const { return pending_.characteristic || queue_size_; }
   const char* status() const;
   uint32_t epoch() const { return epoch_; }
   bool encrypted() const { return encrypted_; }
@@ -105,4 +109,5 @@ class BleRemote {
   bool advertising_active_ = false;
   bool running_ = false;
   QueueHandle_t events_ = nullptr;
+  TaskHandle_t wake_task_ = nullptr;
 };
